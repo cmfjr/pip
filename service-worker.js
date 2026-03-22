@@ -120,52 +120,215 @@ async function togglePictureInPictureOnPage() {
     const deadline = Date.now() + 2000;
 
     while (Date.now() < deadline) {
-      const candidate = pickBestVideoCandidate();
-      if (candidate && candidate.readyState > 0) {
+      const candidate = findCurrentPageVideo();
+      if (isUsableVideo(candidate)) {
         return candidate;
       }
 
       await sleep(150);
     }
 
-    return pickBestVideoCandidate();
+    return findCurrentPageVideo();
   }
 
-  function pickBestVideoCandidate() {
-    const videos = [...document.querySelectorAll("video")];
-    if (!videos.length) {
+  function findCurrentPageVideo() {
+    if (window.location.pathname === "/watch") {
+      return findWatchPageVideo();
+    }
+
+    if (window.location.pathname.startsWith("/shorts/")) {
+      return findShortsPageVideo();
+    }
+
+    return null;
+  }
+
+  function findWatchPageVideo() {
+    const activeWatchPage = findActiveElement("ytd-watch-flexy");
+    if (!activeWatchPage) {
       return null;
     }
 
-    const ranked = videos
-      .filter((video) => video.isConnected)
-      .map((video) => ({
-        video,
-        score: scoreVideo(video)
-      }))
-      .sort((left, right) => right.score - left.score);
-
-    return ranked[0]?.video ?? null;
+    return pickVideoFromContainer(activeWatchPage, [
+      "#movie_player video.html5-main-video",
+      "#movie_player .html5-video-container video",
+      "video.html5-main-video"
+    ]);
   }
 
-  function scoreVideo(video) {
+  function findShortsPageVideo() {
+    const activeShortsRenderer = findActiveShortsRenderer();
+    if (!activeShortsRenderer) {
+      return null;
+    }
+
+    return pickVideoFromContainer(activeShortsRenderer, [
+      "#shorts-player video.html5-main-video",
+      "video.html5-main-video",
+      "video"
+    ]);
+  }
+
+  function findActiveShortsRenderer() {
+    const activeRenderers = [
+      ...document.querySelectorAll(
+        "ytd-reel-video-renderer[is-active], ytd-reel-video-renderer[active]"
+      )
+    ].filter((element) => isElementActive(element));
+
+    if (activeRenderers.length) {
+      activeRenderers.sort((left, right) => {
+        const leftScore = scoreActiveContainer(left);
+        const rightScore = scoreActiveContainer(right);
+        return rightScore - leftScore;
+      });
+
+      return activeRenderers[0];
+    }
+
+    const activeShortsPage = findActiveElement("ytd-shorts");
+    if (!activeShortsPage) {
+      return null;
+    }
+
+    const visibleRenderers = [
+      ...activeShortsPage.querySelectorAll("ytd-reel-video-renderer")
+    ].filter((element) => isElementActive(element));
+    if (!visibleRenderers.length) {
+      return null;
+    }
+
+    visibleRenderers.sort((left, right) => {
+      const leftScore = scoreElementVisibility(left);
+      const rightScore = scoreElementVisibility(right);
+      return rightScore - leftScore;
+    });
+
+    return visibleRenderers[0];
+  }
+
+  function findActiveElement(selector) {
+    const candidates = [...document.querySelectorAll(selector)].filter((element) =>
+      isElementActive(element)
+    );
+    if (!candidates.length) {
+      return null;
+    }
+
+    candidates.sort((left, right) => {
+      const leftScore = scoreActiveContainer(left);
+      const rightScore = scoreActiveContainer(right);
+      return rightScore - leftScore;
+    });
+
+    return candidates[0];
+  }
+
+  function pickVideoFromContainer(container, selectors) {
+    const candidates = [];
+
+    for (const selector of selectors) {
+      candidates.push(...container.querySelectorAll(selector));
+    }
+
+    const rankedVideos = rankContainerVideos(candidates);
+    return rankedVideos[0] ?? null;
+  }
+
+  function rankContainerVideos(videos) {
+    return [...new Set(videos)]
+      .filter((video) => video.isConnected)
+      .filter((video) => !isElementHidden(video))
+      .map((video) => ({
+        video,
+        score: scoreContainerVideo(video)
+      }))
+      .sort((left, right) => right.score - left.score)
+      .map(({ video }) => video);
+  }
+
+  function scoreContainerVideo(video) {
     const rect = video.getBoundingClientRect();
     const area = Math.max(rect.width, 0) * Math.max(rect.height, 0);
-    const style = window.getComputedStyle(video);
-    const visible =
-      rect.width > 0 &&
-      rect.height > 0 &&
-      style.display !== "none" &&
-      style.visibility !== "hidden" &&
-      style.opacity !== "0";
+    const visible = rect.width > 0 && rect.height > 0;
     const readyBonus = video.readyState > 0 ? 2000000 : 0;
     const mainVideoBonus = video.classList.contains("html5-main-video")
       ? 1000000
       : 0;
     const visibleBonus = visible ? 500000 : 0;
     const currentTimeBonus = video.currentTime > 0 ? 1000 : 0;
+    const playingBonus = !video.paused && !video.ended ? 250000 : 0;
+    const endedPenalty = video.ended ? -1000000 : 0;
 
-    return area + readyBonus + mainVideoBonus + visibleBonus + currentTimeBonus;
+    return (
+      area +
+      readyBonus +
+      mainVideoBonus +
+      visibleBonus +
+      currentTimeBonus +
+      playingBonus +
+      endedPenalty
+    );
+  }
+
+  function isUsableVideo(video) {
+    return Boolean(video) && video.readyState > 0 && !isElementHidden(video);
+  }
+
+  function isElementActive(element) {
+    return Boolean(element?.isConnected) && !isElementHidden(element);
+  }
+
+  function isElementHidden(element) {
+    for (let current = element; current; current = current.parentElement) {
+      if (current.hidden) {
+        return true;
+      }
+
+      if (current.getAttribute("aria-hidden") === "true") {
+        return true;
+      }
+
+      const style = window.getComputedStyle(current);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.contentVisibility === "hidden" ||
+        style.opacity === "0"
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function scoreActiveContainer(element) {
+    const visibilityScore = scoreElementVisibility(element);
+    const bestVideoScore = [...element.querySelectorAll("video")].reduce(
+      (best, video) =>
+        Math.max(
+          best,
+          isElementHidden(video) ? 0 : scoreContainerVideo(video)
+        ),
+      0
+    );
+
+    return visibilityScore + bestVideoScore;
+  }
+
+  function scoreElementVisibility(element) {
+    const rect = element.getBoundingClientRect();
+    const area = Math.max(rect.width, 0) * Math.max(rect.height, 0);
+    const viewportOverlap =
+      rect.bottom > 0 &&
+      rect.right > 0 &&
+      rect.top < window.innerHeight &&
+      rect.left < window.innerWidth
+        ? 500000
+        : 0;
+
+    return area + viewportOverlap;
   }
 
   function normalizeError(error) {
